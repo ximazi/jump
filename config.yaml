@@ -1,0 +1,168 @@
+# ===================================================================
+#  Meme 币做空策略配置
+#  密钥不要写在这里 —— 用环境变量 MEME_API_KEY / MEME_API_SECRET
+# ===================================================================
+
+exchange: binance
+base_url: https://fapi.binance.com
+fallback_urls:
+  - https://fapi1.binance.com
+  - https://fapi2.binance.com
+  - https://fapi3.binance.com
+  - https://fapi4.binance.com
+
+# 留空则自动读取环境变量 HTTPS_PROXY / https_proxy
+proxy: ""
+
+# 实盘改用测试网：先在 https://testnet.binancefuture.com 跑通
+testnet: false
+
+# 剩余保证金低于该比例时触发减仓
+min_free_margin_pct: 0.30
+
+
+# ------------------------------------------------------------------
+# 暴跌信号检测
+# ------------------------------------------------------------------
+crash:
+  btc_symbol: BTCUSDT
+  eth_symbol: ETHUSDT
+  tf_intraday: "4h"
+  tf_daily: "1d"
+
+  fast_ema: 20
+  slow_ema: 50
+  swing_lookback: 30          # N 根内的区间下沿
+  drawdown_threshold: 0.05    # 回撤 5% 起计分
+  volume_spike: 1.5           # 放量倍数（相对 20 根均量）
+
+  # 各因子权重，满权重 12.5 -> 归一化 100 分
+  w_ema_cross: 2.5
+  w_swing_break: 3.0
+  w_drawdown: 1.5
+  w_volume: 1.5
+  w_weak_bounce: 1.0
+  w_daily_break: 2.0
+  w_funding_crowd: 1.0
+
+  # 触发门槛：BTC>=50 且 ETH>=40，或 BTC>=78 单边触发
+  # 默认值来自 730 天回测的阈值敏感性扫描 —— 50 分是唯一在「全样本 / 截尾均值 /
+  # 前半段 / 后半段」四项检验中方向一致为正的档位；60 分（等确认）一致为负。
+  # 样本量只有 20~30 次，换周期后务必用 `backtest --sweep` 复验再调参。
+  btc_min_score: 50.0
+  eth_min_score: 40.0
+  btc_solo_score: 78.0
+  funding_crowd_level: 0.0003     # 0.03% 视为多头拥挤
+
+  # ---- 信号模式 ----------------------------------------------------
+  # event = 放量杀跌事件型（回测中显著优于状态型，默认）
+  # state = 原来的状态型评分（价格低位 + 指标空头）
+  # any   = 两者皆可
+  signal_mode: event
+
+  # ---- 放量杀跌（事件型信号）---------------------------------------
+  # 730 天回测：事件触发后做空 Meme 篮子 7 日 +7.77%（胜率 73%，基准仅 +1.09%）
+  climax_volume_ratio: 1.8      # 量比阈值（相对 20 日均量）
+  climax_drop_pct: -0.04        # 当日跌幅阈值
+  climax_max_volume_ratio: 3.0  # 量比上限：太极端=恐慌见底，反而不做空
+                               # （回测 7 日做空：1.8-2.2x +10.17%/90%胜率；
+                               #   2.2-3.0x +3.68%/50%；>3.0x -4.63%/0%）
+  climax_max_age_days: 2       # 事件有效期
+  climax_confirm_score: 25.0    # 事件触发时状态分至少要达到多少
+  climax_require_eth: false     # 事件信号是否也要 ETH 确认
+  climax_min_hold_days: 3       # 最短持有天数，避免当天进当天出
+
+
+# ------------------------------------------------------------------
+# 两段式执行：先做反弹，再做空
+# ------------------------------------------------------------------
+# 回测（n=15）：放量杀跌后
+#   T0+2   反弹（中位 +1.75%，上涨概率 67%）
+#   T0+5   第二段下跌开始（中位 -2.20%）
+#   T0+7   主跌段（中位 -9.46%，上涨概率仅 27%）
+# 先多 2 天再空 5 天：+9.86%、胜率 87%
+# 只做空 7 天        ：+7.77%、胜率 73%
+# 前后半段一致为正：+12.92% / +8.33%
+bounce:
+  enabled: true
+  long_days: 2                 # T0+1 ~ T0+2 做多
+  short_start_offset: 3        # T0+3 开始做空
+  short_end_offset: 7          # T0+7 之后按时间平仓
+  long_risk_per_trade: 0.005   # 反弹腿单笔风险（更小，要接刀）
+  long_max_leverage: 1.5       # 反弹腿不加杠杆
+  # 「反弹已经走完就别追」：进场价较 T0 收盘价涨幅超过此值就跳过反弹腿
+  # （回测：T0+1 收盘进场的反弹腿中位 -0.73%、胜率 47%；漂移>2% 的样本胜率 0%）
+  max_entry_drift: 0.02
+
+
+# ------------------------------------------------------------------
+# Meme 币筛选
+# ------------------------------------------------------------------
+screener:
+  min_market_cap: 5.0e+7      # 5 亿美元以下不做空（庄家可随手拉盘）
+  max_market_cap: 5.0e+10
+  min_quote_volume_24h: 5.0e+6 # 成交额下限。按账户规模调整：账户越大这个值要越高
+  min_beta: 1.0               # 常规回归 beta 下限
+  min_downside_beta: 1.5      # 下跌 beta：暴跌日跌幅放大倍数（策略核心门槛）
+  crash_quantile: 0.15        # 取 BTC 最差 15% 的交易日计算
+  beta_lookback_days: 60
+  crowded_funding: 0.0005     # 0.05% 视为多头拥挤（优先做空）
+  max_funding: 0.003          # 超过 0.3% 视为异常/新币，排除
+  min_onboard_days: 7         # 合约上线不足 7 天的新币排除
+  top_n: 8
+  use_coingecko: true
+  coingecko_category: meme-token
+
+
+# ------------------------------------------------------------------
+# 仓位与风控
+# ------------------------------------------------------------------
+risk:
+  account_equity: 10000.0     # 纸面账户初始权益
+  risk_per_trade: 0.01        # 单笔风险 1%
+  max_leverage: 2.0           # 杠杆上限；策略建议 2~3x，硬上限 5x
+  hard_leverage_cap: 5.0
+  max_position_pct: 0.20      # 单标的名义敞口上限（占权益）
+  max_total_notional_pct: 1.0 # 总名义敞口上限
+  max_positions: 4
+  daily_loss_limit_pct: 0.05  # 单日亏损 5% 熔断
+
+  stop_atr_mult: 1.5
+  min_stop_pct: 0.015         # 最小止损 1.5%
+  max_stop_pct: 0.12          # 最大止损 12%
+  tp1_pct: 0.15               # 第一档止盈 +15%
+  tp1_fraction: 0.5
+  tp2_pct: 0.30               # 第二档止盈 +30%
+  tp2_fraction: 0.5
+  move_stop_to_breakeven: true
+
+  squeeze_funding: -0.001     # 资金费率深度负值 -> 轧空预警，全平
+  min_rr: 1.5                 # 最小盈亏比
+
+
+# ------------------------------------------------------------------
+# 成交与轮询
+# ------------------------------------------------------------------
+broker:
+  live: false                 # 纸面
+  taker_fee: 0.0005
+  maker_fee: 0.0002
+  slippage_pct: 0.003         # 基准滑点 0.3%
+  slippage_depth_factor: 0.5
+  poll_seconds: 20
+  max_spread_bps: 40.0
+
+
+# ------------------------------------------------------------------
+# 通知
+# ------------------------------------------------------------------
+notify:
+  console: true
+  log_file: true
+  log_dir: logs
+  telegram: false
+  telegram_token: ""          # 或用环境变量 TELEGRAM_BOT_TOKEN
+  telegram_chat_id: ""        # 或用环境变量 TELEGRAM_CHAT_ID
+  webhook: false
+  webhook_url: ""             # 或用环境变量 WEBHOOK_URL
+  webhook_type: wechat        # wechat | dingtalk
