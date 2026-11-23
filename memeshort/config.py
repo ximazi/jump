@@ -167,8 +167,22 @@ class RiskConfig:
     tp2_fraction: float = 0.5            # 平掉剩余
     move_stop_to_breakeven: bool = True  # 第一档止盈后止损移到成本价
 
+    trailing_activate_pct: float = 0.08  # 浮盈达到该比例后启动追踪止损
+    trailing_callback_pct: float = 0.04  # 自最佳浮盈回撤该比例触发追踪止损
+
     squeeze_funding: float = -0.001      # 资金费率深度负值 -> 轧空预警，全平
-    min_rr: float = 1.5                  # 最小盈亏比，低于则放弃该标的
+    min_rr: float = 1.5                  # 最小净盈亏比（含往返手续费），低于则放弃
+
+
+@dataclass
+class EntryConfig:
+    """盘中做空入场择时参数。"""
+
+    mode: str = "rebound_reject"         # rebound_reject（破位后弱反弹受阻再空）| immediate
+    timeframe: str = "15m"               # 盘中择时周期
+    ema_len: int = 20                    # 趋势均线周期
+    lookback_bars: int = 16              # 破位结构回看根数
+    atr_buffer_mult: float = 0.35        # 局部反弹高点上方 ATR 缓冲倍数
 
 
 @dataclass
@@ -221,6 +235,7 @@ class Config:
     crash: CrashConfig = field(default_factory=CrashConfig)
     bounce: BounceConfig = field(default_factory=BounceConfig)
     screener: ScreenerConfig = field(default_factory=ScreenerConfig)
+    entry: EntryConfig = field(default_factory=EntryConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)

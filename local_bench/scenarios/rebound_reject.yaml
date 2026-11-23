@@ -1,0 +1,15 @@
+name: rebound_reject_v2
+entry_mode: rebound_reject
+ema_len: 20
+lookback_bars: 16
+atr_buffer_mult: 0.35
+min_stop_pct: 0.012
+max_stop_pct: 0.06
+tp_pct: 0.05
+min_net_rr: 1.2
+round_trip_cost: 0.002
+max_hold_minutes: 240
+trailing_activate_pct: 0.02
+trailing_callback_pct: 0.01
+notional_usd: 200.0
+cooldown_15m_bars: 8

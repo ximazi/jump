@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 import pandas as pd
 import requests
 
-from .utils import to_float
+from .utils import to_float, utc_str
 
 log = logging.getLogger("meme.exchange")
 
@@ -74,6 +74,8 @@ class BinanceFutures:
         self._weight = 0.0
         self._weight_window = 0.0
         self._exchange_info: Optional[Dict[str, Any]] = None
+        # 服务端限速/封禁的到期时间（epoch 秒）。冷却期内不发任何请求。
+        self._cooldown_until = 0.0
 
     # ------------------------------------------------------------ 底层
 
@@ -98,6 +100,38 @@ class BinanceFutures:
             self.api_secret.encode(), qs.encode(), hashlib.sha256
         ).hexdigest()
 
+    # ---------------------------------------------------- 限速冷却
+
+    def cooldown_remaining(self) -> float:
+        """距离限速/封禁到期的秒数。"""
+        return max(0.0, self._cooldown_until - time.time())
+
+    def _enter_cooldown(self, response) -> None:
+        """解析服务端给的真实封禁到期时间，进入冷却。
+
+        币安 418 响应体形如：
+          {"code":-1003,"msg":"Way too many requests; IP(x.x.x.x) banned until 1795409450440. ..."}
+        Retry-After 头则给出秒数。两者都取更晚的那个。
+        """
+        until = time.time() + 60.0
+
+        retry_after = response.headers.get("Retry-After")
+        if (retry_after or "").strip().isdigit():
+            until = max(until, time.time() + float(retry_after))
+
+        m = re.search(r"banned until (\d{10,})", response.text or "")
+        if m:
+            try:
+                until = max(until, int(m.group(1)) / 1000.0)
+            except ValueError:
+                pass
+
+        self._cooldown_until = max(self._cooldown_until, until)
+        log.warning(
+            "进入限速冷却，至 %s（%.0f 秒）",
+            utc_str(self._cooldown_until), self.cooldown_remaining(),
+        )
+
     def _request(
         self,
         method: str,
@@ -107,6 +141,18 @@ class BinanceFutures:
         weight: float = 1.0,
         retries: int = 2,
     ) -> Any:
+        # 冷却期内一个请求都不发。
+        # 币安在 418 响应里会给出精确的封禁到期时间（banned until <epoch_ms>）；
+        # 封禁期间每次重试都会把到期时间往后推 —— 实测因为每 120 秒重试一次，
+        # 一个 6000 秒的封禁被无限延长。所以这里必须真正等到期，而不是缩短重试。
+        remaining = self.cooldown_remaining()
+        if remaining > 0:
+            raise BinanceError(
+                -1003,
+                f"限速冷却中，剩余 {remaining:.0f}s（到期 {utc_str(self._cooldown_until)}）；"
+                f"期间不发起任何请求，避免延长封禁",
+            )
+
         params = dict(params or {})
         headers: Dict[str, str] = {}
         if signed:
@@ -130,13 +176,11 @@ class BinanceFutures:
                         method, url + path, params=params, headers=headers, timeout=self.timeout
                     )
                     if r.status_code in (418, 429):
-                        # 服务端限速：优先遵守 Retry-After，否则按退避等待
-                        retry_after = r.headers.get("Retry-After")
-                        delay = float(retry_after) if (retry_after or "").isdigit() else 0.0
+                        # 服务端限速/封禁：解析真实到期时间并进入冷却
+                        self._enter_cooldown(r)
                         raise BinanceError(
                             r.status_code,
-                            f"被限速 (HTTP {r.status_code})，需等待 {delay or 30:.0f}s "
-                            f"{r.text[:100]}",
+                            f"被限速 (HTTP {r.status_code})：{self._cooldown_remaining():.0f}s 后恢复",
                             url,
                         )
                     if r.status_code == 451:
@@ -163,11 +207,12 @@ class BinanceFutures:
                 except BinanceError as e:
                     last_err = e
                     if e.code in (418, 429):
-                        # 限速：换镜像没用，等待更久再试
-                        m = re.search(r"需等待 (\d+(?:\.\d+)?)s", e.msg)
-                        wait = float(m.group(1)) if m else 30.0
-                        log.warning("触发服务端限速，等待 %.0fs 后重试", wait)
-                        time.sleep(min(wait, 120.0))
+                        # 限速：不再就地重试（那只会延长封禁），交给上层按冷却期等待
+                        log.warning(
+                            "触发服务端限速，冷却 %.0fs（期间不重试）",
+                            self.cooldown_remaining(),
+                        )
+                        break
                         break
                     continue
                 except requests.RequestException as e:

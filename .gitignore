@@ -4,3 +4,11 @@ logs/
 state/
 .env
 config.local.yaml
+# 本地大体积数据与实验输出（仅保留代码、配置与文档入库）
+*.parquet
+local_bench/data/
+local_bench/outputs/
+.pytest_cache/
+
+# 打包产物
+memeshort-v2.zip

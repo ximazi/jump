@@ -263,10 +263,10 @@ def score_at_event(
     d = df_daily[pd.to_datetime(df_daily["open_time"], unit="ms", utc=True).dt.date <= day]
     if len(d) < 22:
         return 0.0, []
-    # T0 收盘时最后一个已完成的 4H bar：开在 T0 20:00，收在 T0 24:00
-    cutoff = int(pd.Timestamp(day, tz="UTC").timestamp() * 1000) + 86400_000 - 4 * 3600_000
-    i = df_intraday[pd.to_datetime(df_intraday["open_time"], unit="ms", utc=True).dt.date < day]
-    if len(i) < cfg.slow_ema + 20:
+    # T0 收盘时最后一个已完成的 4H bar：开在 T0 20:00 UTC，收在 T0 24:00 UTC
+    cutoff_ms = int(pd.Timestamp(day, tz="UTC").timestamp() * 1000) + 86400_000 - 4 * 3600_000
+    i = df_intraday[df_intraday["open_time"] <= cutoff_ms]
+    if len(i) < cfg.slow_ema + 10:
         return 0.0, []
     w = i.iloc[max(0, len(i) - 300):]
     ev = evaluate_crash(w, d.iloc[-22:], 0.0, cfg, symbol="EVENT")

@@ -52,7 +52,7 @@ FALLBACK_MEMES = [
     "POPCAT", "TURBO", "BOME", "NEIRO", "SATS", "MOG", "RATS", "MYRO",
     "SPX6900", "PENGU", "PNUT", "ACT", "GOAT", "MOODENG", "CHILLGUY",
     "GIGACHAD", "AI16Z", "BRETT", "MEME", "FARTCOIN", "ANDY", "LUNA",
-    "TIGER", "BABYDOGE", "MEW", "POPCAT", "DODO", "POL", "SXT",
+    "TIGER", "BABYDOGE", "MEW", "DODO", "POL", "SXT",
 ]
 
 
@@ -67,6 +67,8 @@ class MemeCandidate:
     downside_beta: float = 0.0   # 暴跌日的跌幅放大倍数（策略核心指标）
     spread_bps: float = 0.0
     ask_depth_usd: float = 0.0
+    bid_depth_usd: float = 0.0
+    rel_weakness: float = 0.0    # 近 3 日相对 BTC 弱势度（正值表示比 BTC 更弱）
     onboard_days: int = 999
     price: float = 0.0
     change_24h: float = 0.0
@@ -258,6 +260,10 @@ class MemeScreener:
                 c.change_7d = (
                     float(df["close"].iloc[-1] / df["close"].iloc[-8] - 1) if len(df) >= 8 else 0.0
                 )
+                if len(series) >= 4 and len(btc) >= 4:
+                    asset_3d = float(series.iloc[-1] / series.iloc[-4] - 1.0)
+                    btc_3d = float(btc.iloc[-1] / btc.iloc[-4] - 1.0)
+                    c.rel_weakness = max(0.0, btc_3d - asset_3d)
             except Exception:
                 c.beta = 0.0
                 c.downside_beta = 0.0
@@ -265,6 +271,7 @@ class MemeScreener:
                 di = self.ex.depth_info(c.symbol)
                 c.spread_bps = di.spread_bps
                 c.ask_depth_usd = di.ask_depth_usd_05pct
+                c.bid_depth_usd = di.bid_depth_usd_05pct
             except Exception:
                 c.spread_bps = 999.0
 
@@ -307,14 +314,16 @@ class MemeScreener:
             beta_s = min(1.0, max(0.0, (c.downside_beta - 0.8) / max(cfg.min_downside_beta - 0.8, 0.1)))
             liq_s = (c.quote_volume_24h / max_vol) ** 0.35
             mom_s = min(1.0, max(0.0, c.change_7d / 0.5))  # 前期涨得越多越拥挤
+            weak_s = min(1.0, max(0.0, c.rel_weakness / 0.10))
             c.score = round(
-                30 * crowd + 30 * beta_s + 25 * liq_s + 15 * mom_s, 1
+                25 * crowd + 30 * beta_s + 20 * liq_s + 10 * mom_s + 15 * weak_s, 1
             )
             # 做空时：费率已转负 -> 空头拥挤，赔率变差，扣分
             # 做多时：费率为正 -> 多头拥挤，赔率变差，扣分（方向相反）
             adverse = c.funding_rate if is_long else -c.funding_rate
             if adverse > 0:
-                c.score = round(c.score * (1.0 + min(0.4, adverse / 0.001 * 0.4)), 1)
+                penalty = min(0.45, adverse / 0.001 * 0.45)
+                c.score = round(c.score * (1.0 - penalty), 1)
             if c.funding_rate >= cfg.crowded_funding:
                 c.reasons.append(f"资金费率 {c.funding_rate * 100:+.4f}% 多头拥挤")
             if c.downside_beta >= cfg.min_downside_beta:

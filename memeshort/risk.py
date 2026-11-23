@@ -66,16 +66,22 @@ def parse_step(filters: List[Dict[str, Any]], filter_type: str, key: str = "step
 
 
 def estimate_slippage(
-    candidate: MemeCandidate, order_notional: float, broker_cfg: BrokerConfig
+    candidate: MemeCandidate,
+    order_notional: float,
+    broker_cfg: BrokerConfig,
+    side: str = "SHORT",
 ) -> float:
     """按盘口深度估算本次下单的真实滑点。
 
-    固定滑点是纸上谈兵：盘口深度只有你订单的 1/10 时，成交价会明显劣化。
-    这里把点差成本与深度惩罚都算进去，深度未知时按 2 倍基准惩罚处理。
+    做空市价卖单砸向买盘（bid_depth_usd），做多市价买单吃卖盘（ask_depth_usd）。
+    深度未知时按 2 倍基准惩罚处理。
     """
     base = broker_cfg.slippage_pct
     spread_cost = min(0.005, candidate.spread_bps / 1e4)   # 点差成本，封顶 0.5%
-    depth = candidate.ask_depth_usd
+    if side.upper() == "SHORT":
+        depth = candidate.bid_depth_usd or candidate.ask_depth_usd
+    else:
+        depth = candidate.ask_depth_usd
     if depth <= 0:
         return base * 2 + spread_cost
     if order_notional <= depth:
@@ -97,6 +103,7 @@ def build_plan(
     side: str = "SHORT",
     risk_per_trade: Optional[float] = None,
     max_leverage: Optional[float] = None,
+    structure_stop: Optional[float] = None,
 ) -> Optional[TradePlan]:
     """为一个候选标的生成交易计划；不合格返回 None。
 
@@ -121,7 +128,11 @@ def build_plan(
     broker_cfg = broker_cfg or BrokerConfig()
     # 用单标的仓位上限作为参考下单额来估滑点（偏保守），避免和仓位计算互相依赖
     ref_notional = equity * cfg.max_position_pct
-    slippage = estimate_slippage(candidate, ref_notional, broker_cfg)
+    slippage = estimate_slippage(candidate, ref_notional, broker_cfg, side=side)
+    depth_used = (
+        (candidate.bid_depth_usd or candidate.ask_depth_usd)
+        if not is_long else candidate.ask_depth_usd
+    )
 
     # 滑点按不利方向折价：
     #   做空 -> 在 bid 成交，入场价更低才是更差的结果（止损固定时亏更多）
@@ -129,7 +140,7 @@ def build_plan(
     entry = price * (1.0 + slippage) if is_long else price * (1.0 - slippage)
     notes: List[str] = [
         f"入场价含滑点 {slippage * 100:.2f}%（{'做多' if is_long else '做空'}方向不利折价；"
-        f"点差 {candidate.spread_bps:.1f}bp，0.5%盘口深度 ${candidate.ask_depth_usd / 1e6:.2f}M）"
+        f"点差 {candidate.spread_bps:.1f}bp，0.5%盘口深度 ${depth_used / 1e6:.2f}M）"
     ]
 
     # ---- 止损位 -------------------------------------------------------
@@ -165,6 +176,11 @@ def build_plan(
                 if atr_stop < stop_raw and atr_stop > entry * (1 + cfg.min_stop_pct):
                     stop_raw = atr_stop
                     notes.append(f"ATR 收紧止损至 {atr_stop:.6g}")
+            if structure_stop is not None and structure_stop > entry:
+                # 盘中反弹受阻结构位比日线止损更紧时，优先采用更紧结构止损以提升盈亏比
+                if stop_raw is None or structure_stop < stop_raw:
+                    stop_raw = structure_stop
+                    notes.append(f"采用盘中反弹受阻结构止损 {structure_stop:.6g}")
 
     if stop_raw is None or (is_long and stop_raw >= entry) or (not is_long and stop_raw <= entry):
         stop_raw = entry * (1 - cfg.min_stop_pct * 2) if is_long else entry * (1 + cfg.min_stop_pct * 2)
@@ -232,7 +248,7 @@ def build_plan(
         notional = qty * entry
         leverage = notional / equity
 
-    # ---- 盈亏比校验 ----------------------------------------------------
+    # ---- 净盈亏比校验（扣除双边手续费）---------------------------------
     expected = 0.0
     remaining = 1.0
     for price_tp, frac in tps:
@@ -240,9 +256,12 @@ def build_plan(
         remaining -= frac
     if remaining > 1e-6:
         expected += abs(tp2 - entry) * qty * remaining
-    rr = expected / max(1e-9, qty * risk_per_unit)
+    rt_fee_per_unit = entry * broker_cfg.taker_fee * 2.0
+    net_expected = max(0.0, expected - rt_fee_per_unit * qty)
+    net_risk = qty * (risk_per_unit + rt_fee_per_unit)
+    rr = net_expected / max(1e-9, net_risk)
     if rr < cfg.min_rr:
-        log.info("%s(%s) 盈亏比 %.2f < %.2f，放弃", candidate.symbol, side, rr, cfg.min_rr)
+        log.info("%s(%s) 净盈亏比 %.2f < %.2f，放弃", candidate.symbol, side, rr, cfg.min_rr)
         return None
 
     plan = TradePlan(

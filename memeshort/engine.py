@@ -20,12 +20,13 @@ import pandas as pd
 from .broker import BaseBroker, BrokerAction, PaperBroker, make_broker
 from .config import Config
 from .crash import CrashDetector, CrashEval, CrashSignal
+from .entry import evaluate_rebound_reject_short
 from .exchange import BinanceFutures
 from .notify import Notifier
 from .risk import TradePlan, build_plan
 from .screener import MemeCandidate, MemeScreener
 from .state import Position, StateStore
-from .utils import fmt_qty, fmt_usd
+from .utils import fmt_qty, fmt_usd, utc_str
 
 log = logging.getLogger("meme.engine")
 
@@ -73,6 +74,7 @@ class Engine:
 
         self._tick = 0
         self._next_funding_ts = self._next_funding_time()
+        self.last_funnel: Dict[str, int] = {}
 
     # ---------------------------------------------------- 资金费结算
 
@@ -97,10 +99,12 @@ class Engine:
                     rate = float(self.ex.premium_index(pos.symbol)["lastFundingRate"])
                 except Exception:
                     rate = 0.0
-                amount = rate * pos.entry * pos.remaining_qty
                 if isinstance(self.broker, PaperBroker):
-                    self.broker.accrue_funding(pos, rate, hours=8.0)
+                    amount = self.broker.accrue_funding(pos, rate, hours=8.0)
                 else:
+                    amount = rate * pos.entry * pos.remaining_qty
+                    if pos.side == "LONG":
+                        amount = -amount
                     pos.funding_paid += amount
                     pos.realized_pnl += amount
                 total += amount
@@ -108,6 +112,9 @@ class Engine:
                 log.info("资金费结算：合计 %+.2f USDT", total)
                 self.acct["realized_pnl_today"] = (
                     self.acct.get("realized_pnl_today", 0.0) + total
+                )
+                self.acct["total_realized_pnl"] = (
+                    self.acct.get("total_realized_pnl", 0.0) + total
                 )
             self._next_funding_ts += 28800
 
@@ -216,12 +223,44 @@ class Engine:
         existing_notional = sum(p.notional for p in open_pos)
         perps = self.ex.perpetual_symbols(self.cfg.screener.quote_asset)
         plans: List[TradePlan] = []
+        funnel: Dict[str, int] = {
+            "candidates": len(candidates),
+            "entry_rejected": 0,
+            "risk_rejected": 0,
+            "accepted": 0,
+        }
         is_long = side.upper() == "LONG"
         risk_pct = self.cfg.bounce.long_risk_per_trade if is_long else None
         lev_cap = self.cfg.bounce.long_max_leverage if is_long else None
+        entry_cfg = getattr(self.cfg, "entry", None)
+        use_rebound_filter = (
+            not is_long
+            and entry_cfg is not None
+            and (entry_cfg.mode or "").lower() == "rebound_reject"
+        )
         for c in candidates:
             if len(plans) + len(open_pos) >= self.cfg.risk.max_positions:
                 break
+            structure_stop = None
+            if use_rebound_filter:
+                try:
+                    df_intraday = self.ex.klines(c.symbol, entry_cfg.timeframe, limit=60)
+                    sig = evaluate_rebound_reject_short(
+                        df_intraday,
+                        ema_len=entry_cfg.ema_len,
+                        lookback_bars=entry_cfg.lookback_bars,
+                        atr_buffer_mult=entry_cfg.atr_buffer_mult,
+                    )
+                except Exception as e:
+                    log.warning("%s 盘中择时失败，跳过: %s", c.symbol, e)
+                    funnel["entry_rejected"] += 1
+                    continue
+                if not sig.ready:
+                    log.info("%s 未满足盘中入场条件: %s", c.symbol, sig.reason)
+                    funnel["entry_rejected"] += 1
+                    continue
+                structure_stop = sig.structure_stop
+
             plan = build_plan(
                 c, eq, self.cfg.risk, self.ex,
                 perp_meta=perps.get(c.symbol),
@@ -231,9 +270,14 @@ class Engine:
                 side=side,
                 risk_per_trade=risk_pct,
                 max_leverage=lev_cap,
+                structure_stop=structure_stop,
             )
             if plan:
                 plans.append(plan)
+                funnel["accepted"] += 1
+            else:
+                funnel["risk_rejected"] += 1
+        self.last_funnel = funnel
         return plans
 
     def _open_positions(
@@ -250,6 +294,13 @@ class Engine:
             if pos:
                 pos.phase = phase
                 pos.event_day = event_day
+                if isinstance(self.broker, PaperBroker) and pos.fees_paid > 0:
+                    self.acct["realized_pnl_today"] = (
+                        self.acct.get("realized_pnl_today", 0.0) - pos.fees_paid
+                    )
+                    self.acct["total_realized_pnl"] = (
+                        self.acct.get("total_realized_pnl", 0.0) - pos.fees_paid
+                    )
                 opened.append(pos)
                 self.notifier.order_opened(plan, plan.symbol)
         if opened:
@@ -453,6 +504,25 @@ class Engine:
             )
         try:
             while True:
+                # 限速冷却：整轮都不发请求，睡到封禁到期。
+                # 关键：不能在封禁期间重试 —— 币安每收到一次请求就把封禁往后推，
+                # 实测因为每 120 秒重试一次，一个 6000 秒的封禁被无限延长。
+                cooldown = self.ex.cooldown_remaining()
+                if cooldown > 0:
+                    log.warning(
+                        "限速冷却中，%.0f 秒内不发起任何请求（到期 %s）",
+                        cooldown, utc_str(time.time() + cooldown),
+                    )
+                    self.notifier.send(
+                        "⚠ 触发交易所限速",
+                        f"IP 被限速，{cooldown:.0f} 秒内暂停请求"
+                        f"（到期 {utc_str(time.time() + cooldown)}）。"
+                        f"期间不重试，避免封禁被无限延长。",
+                        level="ERROR",
+                    )
+                    self._persist()
+                    time.sleep(min(cooldown, 600.0))
+                    continue
                 try:
                     self.run_once()
                 except KeyboardInterrupt:

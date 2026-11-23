@@ -1,0 +1,15 @@
+name: trailing_wide_waterfall
+entry_mode: rebound_reject
+ema_len: 20
+lookback_bars: 16
+atr_buffer_mult: 0.4
+min_stop_pct: 0.015
+max_stop_pct: 0.08
+tp_pct: 0.08
+min_net_rr: 1.2
+round_trip_cost: 0.002
+max_hold_minutes: 360
+trailing_activate_pct: 0.025
+trailing_callback_pct: 0.012
+notional_usd: 200.0
+cooldown_15m_bars: 12

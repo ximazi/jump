@@ -63,6 +63,9 @@ class BaseBroker:
     def _do_cancel_all(self, symbol: str) -> None:
         return None
 
+    def _do_update_stop(self, pos: Position, new_stop: float) -> bool:
+        return True
+
     # ---------------------------------------------------- 公共决策
 
     def manage(
@@ -93,7 +96,40 @@ class BaseBroker:
             actions.append(act)
             return actions
 
-        # 3) 止盈
+        # 3) 追踪止损（保护大幅浮盈，应对急跌后的剧烈反抽）
+        trail_activate = getattr(self.risk_cfg, "trailing_activate_pct", 0.08)
+        trail_callback = getattr(self.risk_cfg, "trailing_callback_pct", 0.04)
+        if trail_activate > 0 and trail_callback > 0 and pos.peak_profit_pct >= trail_activate:
+            if is_long:
+                peak_price = pos.entry * (1.0 + pos.peak_profit_pct)
+                trail_stop = peak_price * (1.0 - trail_callback)
+                if trail_stop > pos.stop_loss:
+                    pos.stop_loss = trail_stop
+                    self._do_update_stop(pos, trail_stop)
+                    actions.append(
+                        BrokerAction(
+                            kind="BREAKEVEN",
+                            symbol=pos.symbol,
+                            reason=f"追踪止损上移至 {trail_stop:.8g}",
+                            price=trail_stop,
+                        )
+                    )
+            else:
+                trough_price = pos.entry * (1.0 - pos.peak_profit_pct)
+                trail_stop = trough_price * (1.0 + trail_callback)
+                if trail_stop < pos.stop_loss:
+                    pos.stop_loss = trail_stop
+                    self._do_update_stop(pos, trail_stop)
+                    actions.append(
+                        BrokerAction(
+                            kind="BREAKEVEN",
+                            symbol=pos.symbol,
+                            reason=f"追踪止损下移至 {trail_stop:.8g}",
+                            price=trail_stop,
+                        )
+                    )
+
+        # 4) 止盈
         tp = pos.next_tp()
         if tp is not None:
             tp_hit = (price >= float(tp[0])) if is_long else (price <= float(tp[0]))
@@ -101,23 +137,31 @@ class BaseBroker:
             tp_hit = False
         if tp_hit:
             frac = float(tp[1])
-            actions.append(self._do_close(pos, "TP", float(tp[0]), frac))
+            unfilled_before = sum(1 for t in pos.take_profits if not t[2])
+            close_frac = 1.0 if unfilled_before <= 1 else frac
+            actions.append(self._do_close(pos, "TP", float(tp[0]), close_frac))
             tp[2] = 1  # 标记已触发
-            # 第一档止盈后止损移到成本价
+            # 第一档止盈后止损移至「含双边手续费保本位」，且同步更新交易所保护单
             if (
-                self.risk_cfg.move_stop_to_breakeven
+                pos.status == "OPEN"
+                and self.risk_cfg.move_stop_to_breakeven
                 and not pos.stop_moved_to_breakeven
             ):
-                pos.stop_loss = pos.entry
-                pos.stop_moved_to_breakeven = True
-                actions.append(
-                    BrokerAction(
-                        kind="BREAKEVEN",
-                        symbol=pos.symbol,
-                        reason=f"止损移至成本价 {pos.entry:.8g}",
-                        price=pos.entry,
+                fee_buf = self.cfg.taker_fee * 2.5
+                be_price = pos.entry * (1.0 + fee_buf) if is_long else pos.entry * (1.0 - fee_buf)
+                better = (be_price > pos.stop_loss) if is_long else (be_price < pos.stop_loss)
+                if better:
+                    pos.stop_loss = be_price
+                    pos.stop_moved_to_breakeven = True
+                    self._do_update_stop(pos, be_price)
+                    actions.append(
+                        BrokerAction(
+                            kind="BREAKEVEN",
+                            symbol=pos.symbol,
+                            reason=f"止损移至含费保本位 {be_price:.8g}",
+                            price=be_price,
+                        )
                     )
-                )
         return actions
 
     # ---------------------------------------------------- 对外接口
@@ -178,14 +222,19 @@ class PaperBroker(BaseBroker):
         """
         slip = pos.slippage if getattr(pos, "slippage", 0) else self.cfg.slippage_pct
         is_long = pos.side == "LONG"
-        if reason == "STOP":
-            # 止损：成交价向不利方向劣化
-            fill = price * (1 - slip) if is_long else price * (1 + slip)
+        if reason == "TP":
+            # 限价止盈按目标价成交，不赠送有利方向滑点
+            fill = price
         else:
-            # 止盈/信号平仓：限价单成交，略优于目标价
-            fill = price * (1 + slip) if is_long else price * (1 - slip)
+            # STOP / SQUEEZE / PHASE / TIME 均为市价平仓，成交价向不利方向劣化
+            fill = price * (1 - slip) if is_long else price * (1 + slip)
 
-        qty = min(pos.remaining_qty, pos.remaining_qty * fraction)
+        if fraction >= 1.0:
+            qty = pos.remaining_qty
+        else:
+            # 按原始开仓数量计算分档平仓量，避免 0.5 + 0.5 残留 25%
+            base_qty = pos.qty if pos.qty > 0 else pos.remaining_qty
+            qty = min(pos.remaining_qty, base_qty * fraction)
         if qty <= 0:
             return BrokerAction(kind="NOOP", symbol=pos.symbol, reason="无仓可平")
 
@@ -336,6 +385,28 @@ class LiveBroker(BaseBroker):
                     log.warning("撤单失败 %s %s: %s", symbol, o.get("orderId"), e)
         except Exception as e:
             log.warning("获取挂单失败 %s: %s", symbol, e)
+
+    def _do_update_stop(self, pos: Position, new_stop: float) -> bool:
+        exit_side = "SELL" if pos.side == "LONG" else "BUY"
+        old_stop_id = pos.order_ids.get("stop")
+        if old_stop_id:
+            try:
+                self.ex.cancel_order(pos.symbol, int(old_stop_id))
+            except Exception as e:
+                log.warning("撤销旧止损单失败 %s %s: %s", pos.symbol, old_stop_id, e)
+        if pos.remaining_qty <= 0:
+            return False
+        try:
+            sl = self.ex.place_order(
+                pos.symbol, exit_side, pos.remaining_qty, "STOP_MARKET",
+                stop_price=new_stop, reduce_only=True, working_type="MARK_PRICE",
+            )
+            pos.order_ids["stop"] = sl.get("orderId")
+            log.info("[LIVE] 更新止损单 %s -> %.8g (qty=%.6g)", pos.symbol, new_stop, pos.remaining_qty)
+            return True
+        except Exception as e:
+            log.error("重挂新止损单失败 %s @ %s: %s", pos.symbol, new_stop, e)
+            return False
 
     def _do_close(self, pos: Position, reason: str, price: float, fraction: float) -> BrokerAction:
         qty = min(pos.remaining_qty, pos.remaining_qty * fraction)

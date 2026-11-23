@@ -135,9 +135,22 @@ risk:
   tp2_pct: 0.30               # 第二档止盈 +30%
   tp2_fraction: 0.5
   move_stop_to_breakeven: true
+  trailing_activate_pct: 0.08 # 浮盈达 8% 启动追踪止损
+  trailing_callback_pct: 0.04 # 自最佳浮盈回撤 4% 止盈离场
 
   squeeze_funding: -0.001     # 资金费率深度负值 -> 轧空预警，全平
-  min_rr: 1.5                 # 最小盈亏比
+  min_rr: 1.5                 # 最小净盈亏比（扣除往返手续费）
+
+
+# ------------------------------------------------------------------
+# 盘中入场择时（避免急跌追空在地板上）
+# ------------------------------------------------------------------
+entry:
+  mode: rebound_reject        # rebound_reject（推荐）| immediate
+  timeframe: "15m"
+  ema_len: 20
+  lookback_bars: 16
+  atr_buffer_mult: 0.35
 
 
 # ------------------------------------------------------------------

@@ -200,19 +200,52 @@ PEPE 1.29     DOGE 1.33   SHIB 1.26
 main.py                 CLI 入口（scan / run / status / backtest / reset）
 selftest.py             全链路自检（纸面，不下真实单）
 config.yaml             全部参数（密钥一律走环境变量，不写这里）
+tests/                  离线单元测试（不联网，秒级回归）
+local_bench/            本地 Parquet 回放与对照实验
+docs/LOCAL_TESTING.md   测试规范与提交流程
 memeshort/
   config.py             配置加载（含 YAML 数值强制转换）
   exchange.py           Binance 客户端：公开行情 + HMAC 签名下单 + 镜像轮换
   indicators.py         EMA/RSI/ATR/常规 β/下跌 β
   crash.py              暴跌信号：放量杀跌事件检测 + 状态评分 + 阶段计算
   screener.py           Meme 币筛选：硬过滤 + 多维打分（按多空方向翻转费率偏好）
-  risk.py               仓位/止损/止盈/盈亏比/深度感知滑点（多空通用）
+  risk.py               仓位/止损/止盈/净盈亏比/深度感知滑点（多空通用）
+  entry.py              盘中入场择时过滤器（15m 破位→弱反弹受阻→二次转弱）
   broker.py             纸面撮合 与 实盘下单（共用同一套决策逻辑，多空通用）
   notify.py             终端 + 日志 + Telegram + 企业微信/钉钉
   state.py              持仓与账户状态持久化（JSON，重启可恢复）
-  engine.py             主引擎：事件 → 选币 → 建仓 → 阶段切换 → 监控
+  engine.py             主引擎：事件 → 选币 → 择时 → 建仓 → 阶段切换 → 监控
   backtest.py           历史回测（状态型 / 事件型 / 两段式 对比）
 ```
+
+### v2 升级内容
+
+**核心策略**
+
+| 模块 | 变更 |
+|---|---|
+| `entry.py` | 新增。15m 级别的「破位 → 缩量弱反弹受阻 → 二次转弱」入场过滤器，输出带 ATR 缓冲的局部反弹高点止损位。解决直接市价追空空在急跌底部的问题 |
+| `risk.py` | 净盈亏比（Net RR，扣除往返手续费）；做空滑点改按**买盘深度**估算（卖单砸向买盘）；支持接入盘中结构止损位 |
+| `broker.py` | 追踪止损（`trailing_activate_pct` / `trailing_callback_pct`）；分档止盈基数修正为 `0.5 + 0.5` 清仓零残留；保本止损含双边手续费；LiveBroker 移动止损时撤旧 STOP_MARKET 并按剩余仓位重挂 |
+| `screener.py` | 修复负资金费率做空的惩罚符号（原先是加分）；新增买盘深度与「近 3 日相对 BTC 弱势度」因子 |
+| `crash.py` | 修复 `score_at_event` 的截断逻辑，确保包含 T0 当天已完成的所有 4H K 线 |
+| `engine.py` / `state.py` | 修复资金费多空方向；同步 `total_realized_pnl` 与纸面开仓手续费入账；跨日解除 `halted` 熔断标志 |
+| `exchange.py` | **限速冷却**：解析服务端返回的真实封禁到期时间，冷却期内不发任何请求、不重试 |
+
+**为什么「冷却期不重试」是必须的**：币安的 418 响应体里带精确封禁到期时间
+（`banned until <epoch_ms>`），且**每次重试都会把封禁往后推**。
+早期版本每 120 秒重试一次，结果一个 6000 秒的封禁被无限延长——实测中程序因此
+连续数小时拿不到行情，持仓完全失去监控。现在冷却期内一个请求都不发。
+
+**离线验证**
+
+```bash
+python -m unittest discover -s tests -v     # 7 项核心修复的离线回归，秒级
+```
+
+把本地 5m `*.parquet` 放进 `local_bench/data/` 后可做对照回放
+（baseline / rebound_reject / trailing_wide 三套场景），产出
+`route_attempts.csv`、`trades.csv`、`summary.json`。详见 `docs/LOCAL_TESTING.md`。
 
 ### 信号：事件型（默认）
 

@@ -132,9 +132,10 @@ class StateStore:
         os.replace(tmp, self.account_file)
 
     def rollover_day(self, acct: Dict[str, Any]) -> Dict[str, Any]:
-        """跨日重置日内盈亏。"""
+        """跨日重置日内盈亏与日内熔断状态。"""
         today = time.strftime("%Y-%m-%d")
         if acct.get("day") != today:
             acct["day"] = today
             acct["realized_pnl_today"] = 0.0
+            acct["halted"] = False
         return acct
